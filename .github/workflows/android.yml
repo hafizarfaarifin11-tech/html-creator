@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     name: Build Debug APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,80 +22,84 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # Use the maintained Android SDK setup action. It installs command-line
+      # tools, accepts SDK licenses, and installs the packages requested below.
+      - name: Set up Android SDK (API 35)
+        uses: android-actions/setup-android@v4.0.4
+        with:
+          cmdline-tools-version: '15859902'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
 
-      - name: Find or extract Android project
+      # This project does not rely on the Gradle wrapper. Provision Gradle 8.9
+      # directly so a missing gradle-wrapper.jar cannot break the CI build.
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.9'
+          validate-wrappers: false
+
+      - name: Find or extract HTML Maker project
         shell: bash
         run: |
           set -euo pipefail
-
           SEARCH_ROOT="$GITHUB_WORKSPACE"
-          SETTINGS_FILE="$(find "$SEARCH_ROOT" \
-            -type f -name 'settings.gradle' \
-            -not -path '*/.git/*' \
-            -not -path '*/.gradle/*' \
-            -print -quit || true)"
+          SETTINGS_FILE="$(find "$SEARCH_ROOT" -type f -name 'settings.gradle' \
+            -not -path '*/.git/*' -not -path '*/.gradle/*' -print -quit || true)"
 
-          # If the repository contains the project ZIP instead of extracted files,
-          # unpack it automatically and search again.
-          if [ -z "$SETTINGS_FILE" ]; then
-            mapfile -t ZIP_FILES < <(find "$GITHUB_WORKSPACE" -maxdepth 4 \
-              -type f -iname '*.zip' -not -path '*/.git/*' -print)
-
-            if [ "${#ZIP_FILES[@]}" -gt 0 ]; then
-              EXTRACT_DIR="$RUNNER_TEMP/html-maker-extracted"
-              mkdir -p "$EXTRACT_DIR"
-              for ZIP_FILE in "${ZIP_FILES[@]}"; do
-                echo "Extracting: $ZIP_FILE"
-                unzip -oq "$ZIP_FILE" -d "$EXTRACT_DIR"
-              done
-              SEARCH_ROOT="$EXTRACT_DIR"
-              SETTINGS_FILE="$(find "$SEARCH_ROOT" \
-                -type f -name 'settings.gradle' \
-                -not -path '*/.gradle/*' \
-                -print -quit || true)"
+          # If only the ZIP archive was uploaded, extract it before searching again.
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            mapfile -t ZIP_FILES < <(find "$GITHUB_WORKSPACE" -type f -iname '*.zip' \
+              -not -path '*/.git/*' -print | sort)
+            if [[ "${#ZIP_FILES[@]}" -eq 0 ]]; then
+              echo "::error::Tidak menemukan settings.gradle atau file ZIP proyek."
+              echo "Isi repository:"
+              find "$GITHUB_WORKSPACE" -maxdepth 5 -type f -not -path '*/.git/*' -print | sort | head -250
+              exit 1
             fi
+
+            EXTRACT_DIR="$RUNNER_TEMP/html-maker-project"
+            mkdir -p "$EXTRACT_DIR"
+            for ZIP_FILE in "${ZIP_FILES[@]}"; do
+              echo "Extracting: $ZIP_FILE"
+              unzip -oq "$ZIP_FILE" -d "$EXTRACT_DIR"
+            done
+            SEARCH_ROOT="$EXTRACT_DIR"
+            SETTINGS_FILE="$(find "$SEARCH_ROOT" -type f -name 'settings.gradle' \
+              -not -path '*/.gradle/*' -print -quit || true)"
           fi
 
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::File settings.gradle belum ditemukan."
-            echo "Pastikan repository berisi seluruh source project atau unggah ZIP HTML Maker."
-            echo "Isi repository (maksimal 4 tingkat):"
-            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -print | sort | head -200
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "::error::settings.gradle tetap tidak ditemukan setelah ekstraksi ZIP."
+            find "$SEARCH_ROOT" -maxdepth 7 -type f -print | sort | head -300
             exit 1
           fi
 
           PROJECT_DIR="$(cd "$(dirname "$SETTINGS_FILE")" && pwd)"
-          if [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
-            echo "::error::settings.gradle ditemukan, tetapi app/build.gradle tidak ada di $PROJECT_DIR"
+          if [[ ! -f "$PROJECT_DIR/app/build.gradle" ]]; then
+            echo "::error::app/build.gradle tidak ditemukan di $PROJECT_DIR"
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Android project found at: $PROJECT_DIR"
+          echo "Project found: $PROJECT_DIR"
+          echo "Settings file: $SETTINGS_FILE"
 
-      - name: Install Android SDK packages
-        shell: bash
-        run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
-
-      - name: Install Gradle 8.9
+      - name: Verify Android SDK and Gradle
         shell: bash
         run: |
           set -euo pipefail
-          GRADLE_VERSION="8.9"
-          GRADLE_ZIP="$RUNNER_TEMP/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fL --retry 3 --retry-delay 2 \
-            "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
-            -o "$GRADLE_ZIP"
-          unzip -q "$GRADLE_ZIP" -d "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          echo "ANDROID_HOME=${ANDROID_HOME:-not-set}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-not-set}"
+          command -v sdkmanager
+          sdkmanager --list_installed | grep -E 'platforms;android-35|build-tools;35.0.0|platform-tools' || true
+          java -version
+          gradle --version
 
       - name: Build debug APK
         shell: bash
-        run: gradle --no-daemon -p "$PROJECT_DIR" clean assembleDebug
+        run: gradle --no-daemon --stacktrace -p "$PROJECT_DIR" clean assembleDebug
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
